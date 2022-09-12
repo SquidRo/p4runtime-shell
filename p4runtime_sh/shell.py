@@ -27,6 +27,7 @@ import sys
 from p4runtime_sh.p4runtime import (P4RuntimeClient, P4RuntimeException, parse_p4runtime_error,
                                     SSLOptions)
 from p4.v1 import p4runtime_pb2
+from p4.v1 import p4data_pb2
 from p4.config.v1 import p4info_pb2
 from . import bytes_utils
 from . global_options import global_options
@@ -35,7 +36,6 @@ from .utils import UserError, InvalidP4InfoError
 import google.protobuf.text_format
 from google.protobuf import descriptor
 import queue
-
 
 context = Context()
 client = None
@@ -2206,6 +2206,199 @@ To write to the meter, use <self>.modify
         return super().read(function)
 
 
+#only support bitstring...
+class _RegisterData:
+    @staticmethod
+    def attrs():
+        return ["bitstring"]
+
+    def __init__(self, data_name):
+        self._data_name = data_name
+        self._msg = p4data_pb2.P4Data()
+        self._attrs = _RegisterData.attrs()
+
+    def __dir__(self):
+        return self._attrs
+
+    def __setattr__(self, name, value):
+        if name[0] == "_":
+            super().__setattr__(name, value)
+            return
+
+        if name not in self._attrs:
+            raise UserError("can not set {}".format(name))
+
+        setattr(self._msg, name, value)
+
+    def __getattr__(self, name):
+        if name == "bitstring":
+            return getattr(self._msg, name)
+
+        raise AttributeError("'{}' object has no attribute '{}'".format(
+            self.__class__.__name__, name))
+
+    def msg(self):
+        return self._msg
+
+    def _from_msg(self, msg):
+        self._msg.CopyFrom(msg)
+
+    def __str__(self):
+        return str(self.msg())
+
+    def _repr_pretty_(self, p, cycle):
+        p.text(str(self.msg()))
+
+    @classmethod
+    def set_bitstring(cls, instance, data_name, name, value):
+        if instance is None:
+            d = cls(data_name)
+        else:
+            d = instance
+        setattr(d, name, value)
+        return d
+
+    @classmethod
+    def get_bitstring(cls, instance, data_name, name):
+        if instance is None:
+            d = cls(data_name)
+        else:
+            d = instance
+        r = getattr(d, name)
+        return d, r
+
+
+class _RegisterEntryBase(_P4EntityBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._data = None
+
+    def __dir__(self):
+        return super().__dir__() + _RegisterData.attrs() + [
+            "clear_data"]
+
+    def __call__(self, **kwargs):
+        for name, value in kwargs.items():
+            setattr(self, name, value)
+        return self
+
+    def __setattr__(self, name, value):
+        if name[0] == "_" or not self._init:
+            super().__setattr__(name, value)
+            return
+        if name == "name":
+            raise UserError("Cannot change register name")
+
+        if name == "bitstring":
+            if type(value) is not int:
+                raise UserError("bitstring must be an integer")
+
+            if hasattr(self._info.type_spec, 'bitstring'):
+                #TODO: how to convert bitwidth of not multiple of 8 bits ?
+                len_byte = (self._info.type_spec.bitstring.bit.bitwidth+7) // 8
+                self._data = _RegisterData.set_bitstring(
+                    self._data, self.name, name, value.to_bytes(len_byte, 'big'))
+            else:
+                raise UserError("register type is not a bitstring")
+
+            return
+
+        if name == "data":
+            if value is None:
+                self._data = None
+                return
+            raise UserError("Cannot set 'data' directly")
+        super().__setattr__(name, value)
+
+    def __getattr__(self, name):
+        if name == "bitstring":
+            self._data, r = _RegisterData.get_bitstring(self._data, self.name, name)
+            return r
+
+        if name == "data":
+            if self._data is None:
+                self._data = _RegisterData(self.name)
+            return self._data
+        return super().__getattr__(name)
+
+    def _from_msg(self, msg):
+        self._entry.CopyFrom(msg)
+        self._data = None
+        if msg.HasField('data'):
+            self._data = _RegisterData(self.name)
+            self._data._from_msg(msg.data)
+        else:
+            self._data = None
+
+    def _update_msg(self):
+        if self._data is None:
+            self._entry.ClearField('data')
+        else:
+            self._entry.data.CopyFrom(self._data.msg())
+
+    def clear_data(self):
+        """Clear all register data, same as <self>.data = None"""
+        self._data = None
+
+
+class RegisterEntry(_RegisterEntryBase):
+    def __init__(self, register_name=None):
+        super().__init__(
+            P4Type.register, P4RuntimeEntity.register_entry,
+            p4runtime_pb2.RegisterEntry, register_name,
+            modify_only=True)
+        self._entry.register_id = self.id
+        self.__doc__ = """
+An entry for register '{}'
+
+Use <self>.info to display the P4Info entry for this register.
+
+Set the index with <self>.index = <expr>.
+To reset it (e.g. for wildcard read), set it to None.
+
+Access bitstring with <self>.bitstring.
+
+To read from the register, use <self>.read
+To write to the register, use <self>.modify
+""".format(register_name)
+        self._init = True
+
+    def __dir__(self):
+        return super().__dir__() + ["index", "data"]
+
+    def __setattr__(self, name, value):
+        if name == "index":
+            if value is None:
+                self._entry.ClearField('index')
+                return
+            if type(value) is not int:
+                raise UserError("index must be an integer")
+            self._entry.index.index = value
+            return
+        super().__setattr__(name, value)
+
+    def __getattr__(self, name):
+        if name == "index":
+            return self._entry.index.index
+        return super().__getattr__(name)
+
+    def read(self, function=None):
+        """Generate a P4Runtime Read RPC. Supports wildcard reads (just leave
+        the index unset).
+        If function is None, returns an iterator. Iterate over it to get all the
+        register entries (RegisterEntry instances) returned by the
+        server. Otherwise, function is applied to all the register entries
+        returned by the server.
+
+        For example:
+        for c in <self>.read():
+            print(c)
+        The above code is equivalent to the following one-liner:
+        <self>.read(lambda c: print(c))
+        """
+        return super().read(function)
+
+
 class P4RuntimeEntityBuilder:
     def __init__(self, obj_type, entity_type, entity_cls):
         self._obj_type = obj_type
@@ -2855,12 +3048,14 @@ def main():
         "CloneSessionEntry": CloneSessionEntry,
         "APIVersion": APIVersion,
         "global_options": global_options,
+        "RegisterEntry" : RegisterEntry,
     }
 
     for obj_type in P4Type:
         user_ns[obj_type.p4info_name] = P4Objects(obj_type)
 
     supported_entities = [
+        (P4RuntimeEntity.register_entry, P4Type.register, RegisterEntry),
         (P4RuntimeEntity.table_entry, P4Type.table, TableEntry),
         (P4RuntimeEntity.counter_entry, P4Type.counter, CounterEntry),
         (P4RuntimeEntity.direct_counter_entry, P4Type.direct_counter, DirectCounterEntry),
